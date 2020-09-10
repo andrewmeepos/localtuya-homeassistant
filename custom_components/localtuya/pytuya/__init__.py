@@ -185,53 +185,41 @@ class XenonDevice(object):
         Args:
             payload(bytes): Data to send.
         """
-       # log.debug("Running _send_receive from init where self=%s payload=%s", self, payload)
         try:
-            log.debug("Trying to connect to socket from _send_receive from init")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.settimeout(self.connection_timeout)
             s.connect((self.address, self.port))
         except Exception as e:
-            print('Failed to connect to %s. Raising Exception.' % (self.address))
-            log.debug("Failed to connect to %s on port %s from _send_receive from init", self.address, self.port) 
+            print('Failed to connect to %s. Raising Exception.' % (self.address)) 
             raise e   
         try:
-            log.debug("trying to send payload from init _send_receive")
             s.send(payload)
         except Exception as e:
-            print('Failed to send payload to %s. Raising Exception.' % (self.address))
-            log.debug("Failed to send payload to %s. Raising Ecxeption", self.address) 
+            print('Failed to send payload to %s. Raising Exception.' % (self.address)) 
             #s.close()
             raise e   
 
         try:
             data = s.recv(1024)
-            log.debug("set data=s.recv(1024)")
 #            print("FIRST:  Received %d bytes" % len(data) )
         # sometimes the first packet does not contain data (typically 28 bytes): need to read again
             if len(data) < 40:
-                log.debug("len(data) was <40, sleeping for 0.1, then going to data=s.recv(1024) again")
                 time.sleep(0.1)
                 data = s.recv(1024)
-                log.debug("set data=s.recv(1024) from len<40 where data=%s", data)
 #                print("SECOND: Received %d bytes" % len(data) )
         except Exception as e:
-            print('Failed to receive data from %s. Raising Exception.' % (self.address))
-            log.debug("Failed to receive data from %s. Raising Exception", self.address) 
+            print('Failed to receive data from %s. Raising Exception.' % (self.address)) 
             #s.close()
             raise e   
 
-        log.debug("About to close socket s.close()")
         s.close()
         return data
 
     def set_version(self, version):
-        log.debug("Setting version from init where self=%s and version=%s", self, version)
         self.version = version
 
     def set_dpsUsed(self, dpsUsed):
-        log.debug("Setting set_dpsUsed from init where self=%s and dpsUsed=%s", self, dpsUsed)
         self.dpsUsed = dpsUsed
 
     def generate_payload(self, command, data=None):
@@ -244,9 +232,7 @@ class XenonDevice(object):
             data(dict, optional): The data to be send.
                 This is what will be passed via the 'dps' entry
         """
-       # log.debug("generate_payload(self, command, data=None) from init where command=%s", command)
         json_data = payload_dict[self.dev_type][command]['command']
-       # log.debug("json_data from init = %s", json_data)
         command_hb = payload_dict[self.dev_type][command]['hexByte']
 
         if 'gwId' in json_data:
@@ -259,10 +245,8 @@ class XenonDevice(object):
             json_data['t'] = str(int(time.time()))
 
         if data is not None:
-            log.debug("data was not None, setting json_data['dps']=data where data=%s", data)
             json_data['dps'] = data
         if command_hb == '0d':
-            log.debug("command_hb==0d so setting json_data[dps]=self.dpsUsed where self.dpsUsed=%s", self.dpsUsed)
             json_data['dps'] = self.dpsUsed
 #            log.info('******** COMMAND IS %r', self.dpsUsed)
 
@@ -271,11 +255,10 @@ class XenonDevice(object):
         #print(json_payload)
         json_payload = json_payload.replace(' ', '')  # if spaces are not removed device does not respond!
         json_payload = json_payload.encode('utf-8')
-        log.debug('json_payload from init generate_payload= %r', json_payload)
+        log.debug('json_payload=%r', json_payload)
         #print('json_payload = ', json_payload, ' cmd = ', command_hb)
 
         if self.version == 3.3:
-          #  log.debug("self.version==3.3, get ready for cipher")
             self.cipher = AESCipher(self.local_key)  # expect to connect and then disconnect to set new
             json_payload = self.cipher.encrypt(json_payload, False)
             self.cipher = None
@@ -283,7 +266,6 @@ class XenonDevice(object):
                 # add the 3.3 header
                 json_payload = PROTOCOL_VERSION_BYTES_33 + b"\0\0\0\0\0\0\0\0\0\0\0\0" + json_payload
         elif command == SET:
-            log.debug("self.version was not ==3.3, instead command==SET, get ready for cipher")
             # need to encrypt
             #print('json_payload %r' % json_payload)
             self.cipher = AESCipher(self.local_key)  # expect to connect and then disconnect to set new
@@ -330,26 +312,24 @@ class XenonDevice(object):
         #print('full buffer(%d) %r' % (len(buffer), bin2hex(buffer, pretty=True) ))
         #print('full buffer(%d) %r' % (len(buffer), " ".join("{:02x}".format(ord(c)) for c in buffer)))
         return buffer
-
+    
 class Device(XenonDevice):
     def __init__(self, dev_id, address, local_key=None, dev_type=None):
-        log.debug("def __init__ from init")
         super(Device, self).__init__(dev_id, address, local_key, dev_type)
-
+    
     def status(self):
-        log.debug('status(self) entry from init (dev_type is %s)', self.dev_type)
+        #log.debug('status() entry (dev_type is %s)', self.dev_type)
         # open device, send request, then close connection
         payload = self.generate_payload('status')
-       # log.debug("payload generated from def status(self) from init=%s", payload)
 
         data = self._send_receive(payload)
-        log.debug('status received from def status(self) from init')
+        #log.debug('status received data=%r', data)
 
         result = data[20:-8]  # hard coded offsets
         if self.dev_type != 'device20':
             result = result[15:]
 
-#        log.debug('result=%r', result)
+        log.debug('result=%r', result)
         #result = data[data.find('{'):data.rfind('}')+1]  # naive marker search, hope neither { nor } occur in header/footer
         #print('result %r' % result)
         if result.startswith(b'{'):
@@ -365,26 +345,26 @@ class Device(XenonDevice):
             result = result[16:]  # remove (what I'm guessing, but not confirmed is) 16-bytes of MD5 hexdigest of payload
             cipher = AESCipher(self.local_key)
             result = cipher.decrypt(result)
-            log.debug('decrypted result from def status(self) from init=%r', result)
+            log.debug('decrypted result=%r', result)
             if not isinstance(result, str):
                 result = result.decode()
             result = json.loads(result)
         elif self.version == 3.3: 
             cipher = AESCipher(self.local_key)
             result = cipher.decrypt(result, False)
-            log.debug('decrypted result from def status(self) from init=%r', result)
+            log.debug('decrypted result=%r', result)
             if not isinstance(result, str):
                 result = result.decode()
             result = json.loads(result)
         else:
-            log.error('Unexpected status() from status(self) from init,  payload=%r', result)
+            log.error('Unexpected status() payload=%r', result)
 
 #        if self.dev_type == 'cover':
 #        result = result.encode('utf-8')
 #        log.debug('encoded result=%r', result)
         return result
 
-    def set_status(self, on, switch=1): # TODO Allow switch to be set via config (dps MIGHT not be 1 for set_status)
+    def set_status(self, on, switch=1):
         """
         Set status of the device to 'on' or 'off'.
         
@@ -393,14 +373,13 @@ class Device(XenonDevice):
             switch(int): The switch to set
         """
         # open device, send request, then close connection
-        log.debug("set_status running from init where self=%s, on=%s, switch=1", self, on)
         if isinstance(switch, int):
             switch = str(switch)  # index and payload is a string
         payload = self.generate_payload(SET, {switch:on})
         #print('payload %r' % payload)
 
         data = self._send_receive(payload)
-        log.debug('set_status received data=%r', data)
+        #log.debug('set_status received data=%r', data)
 
         return data
     
@@ -413,7 +392,6 @@ class Device(XenonDevice):
             value(int): new value for the index
         """
         # open device, send request, then close connection
-        log.debug("set_value running from init where self=%s, index=%s, value=%s", self, index, value)
         if isinstance(index, int):
             index = str(index)  # index and payload is a string
 
@@ -426,11 +404,9 @@ class Device(XenonDevice):
     
     def turn_on(self, switch=1):
         """Turn the device on"""
-        log.debug("turn_on called from init where self=%s and switch=1", self)
         self.set_status(True, switch)
 
     def turn_off(self, switch=1):
-        log.debug("turn_off called from init where self=%s and switch=1", self)
         """Turn the device off"""
         self.set_status(False, switch)
 
@@ -444,7 +420,6 @@ class Device(XenonDevice):
         # FIXME / TODO support schemas? Accept timer id number as parameter?
 
         # Dumb heuristic; Query status, pick last device id as that is probably the timer
-        log.debug("set_timer called from init where self=%s and num_secs=%s", self, num_secs)
         status = self.status()
         devices = status['dps']
         devices_numbers = list(devices.keys())
@@ -454,7 +429,7 @@ class Device(XenonDevice):
         payload = self.generate_payload(SET, {dps_id:num_secs})
 
         data = self._send_receive(payload)
-        log.debug('set_timer received data=%r', data)
+        #log.debug('set_timer received data=%r', data)
         return data
 
 class OutletDevice(Device):
@@ -467,17 +442,16 @@ class FanDevice(Device):
     def __init__(self, dev_id, address, local_key=None):
         super(FanDevice, self).__init__(dev_id, address, local_key)
 
-class CoverEntity(Device):
-#    DPS_INDEX_MOVE       = '1'
-#    DPS_INDEX_BL         = '101'
+class CoverDevice(Device):
+    DPS_INDEX_MOVE       = '1'
+    DPS_INDEX_BL         = '101'
 
-#    DPS_2_STATE = {
-#                '1':'movement',
-#                '101':'backlight',
-#                }
+    DPS_2_STATE = {
+                '1':'movement',
+                '101':'backlight',
+                }
 
     def __init__(self, dev_id, address, local_key=None):
-        log.debug("__init__ coverEntity from init where self=%s, dev_id=%s, address=%s, local_key=None", self, dev_id, address)
         print('%s version %s' % ( __name__, version))
         print('Python %s on %s' % (sys.version, sys.platform))
         if Crypto is None:
@@ -486,20 +460,17 @@ class CoverEntity(Device):
         else:
             print('Using PyCrypto ', Crypto.version_info)
             print('Using PyCrypto from ', Crypto.__file__)
-        super(CoverEntity, self).__init__(dev_id, address, local_key)
+        super(CoverDevice, self).__init__(dev_id, address, local_key)
     
     def open_cover(self, switch=1):
-        log.debug("open_cover run from CoverEntity of init")
         """Turn the device on"""
         self.set_status('on', switch)
 
     def close_cover(self, switch=1):
-        log.debug("close_cover run from CoverEntity of init")
         """Turn the device off"""
         self.set_status('off', switch)
 
     def stop_cover(self, switch=1):
-        log.debug("stop_cover run from CoverEntity of init")
         """Turn the device off"""
         self.set_status('stop', switch)
 
