@@ -22,52 +22,47 @@ switch:
       sw02:
         name: usb_plug
         friendly_name: USB Plug
-        id: 7  
+        id: 7
 """
 import logging
-import voluptuous as vol
-
-from homeassistant.components.switch import SwitchEntity, PLATFORM_SCHEMA
-from homeassistant.const import (
-    CONF_HOST,
-    CONF_ID,
-    CONF_ENTITIES,
-    CONF_SWITCHES,
-    CONF_DEVICE_ID,
-    CONF_FRIENDLY_NAME,
-    CONF_ICON,
-    CONF_NAME,
-    CONF_PLATFORM,
-)
-from homeassistant.config_entries import SOURCE_IMPORT
-import homeassistant.helpers.config_validation as cv
 from time import time, sleep
 from threading import Lock
 
-from . import pytuya
+import voluptuous as vol
+
+from homeassistant.components.switch import (
+    SwitchEntity,
+    DOMAIN,
+    PLATFORM_SCHEMA,
+)
+from homeassistant.const import (
+    CONF_ID,
+    CONF_SWITCHES,
+    CONF_FRIENDLY_NAME,
+    CONF_NAME,
+)
+import homeassistant.helpers.config_validation as cv
+
+from . import BASE_PLATFORM_SCHEMA, prepare_setup_entities, import_from_yaml
 from .const import (
     ATTR_CURRENT,
     ATTR_CURRENT_CONSUMPTION,
     ATTR_VOLTAGE,
-    CONF_LOCAL_KEY,
-    CONF_PROTOCOL_VERSION,
     CONF_CURRENT,
     CONF_CURRENT_CONSUMPTION,
     CONF_VOLTAGE,
-    DOMAIN,
 )
+from .pytuya import TuyaDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-REQUIREMENTS = ["pytuya==7.0.9"]
-
 DEFAULT_ID = "1"
-DEFAULT_PROTOCOL_VERSION = 3.3
 
+# TODO: This will eventully merge with flow_schema
 SWITCH_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_ID, default=DEFAULT_ID): cv.string,
-        vol.Required(CONF_NAME): cv.string,
+        vol.Optional(CONF_NAME): cv.string,  # Deprecated: not used
         vol.Required(CONF_FRIENDLY_NAME): cv.string,
         vol.Optional(CONF_CURRENT, default="-1"): cv.string,
         vol.Optional(CONF_CURRENT_CONSUMPTION, default="-1"): cv.string,
@@ -75,18 +70,8 @@ SWITCH_SCHEMA = vol.Schema(
     }
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(BASE_PLATFORM_SCHEMA).extend(
     {
-        vol.Optional(CONF_ICON): cv.icon,
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_DEVICE_ID): cv.string,
-        vol.Required(CONF_LOCAL_KEY): cv.string,
-        vol.Required(CONF_NAME): cv.string,
-        vol.Required(CONF_FRIENDLY_NAME): cv.string,
-        vol.Required(
-            CONF_PROTOCOL_VERSION, default=DEFAULT_PROTOCOL_VERSION
-        ): vol.Coerce(float),
-        vol.Optional(CONF_ID, default=DEFAULT_ID): cv.string,
         vol.Optional(CONF_CURRENT, default="-1"): cv.string,
         vol.Optional(CONF_CURRENT_CONSUMPTION, default="-1"): cv.string,
         vol.Optional(CONF_VOLTAGE, default="-1"): cv.string,
@@ -94,41 +79,34 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
-DPS_FIELDS = [
-    vol.Required(CONF_CURRENT),
-    vol.Required(CONF_CURRENT_CONSUMPTION),
-    vol.Required(CONF_VOLTAGE),
-]
+
+def flow_schema(dps):
+    """Return schema used in config flow."""
+    return {
+        vol.Optional(CONF_CURRENT): vol.In(dps),
+        vol.Optional(CONF_CURRENT_CONSUMPTION): vol.In(dps),
+        vol.Optional(CONF_VOLTAGE): vol.In(dps),
+    }
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """Setup a Tuya switch based on a config entry."""
-    switches_to_setup = [
-        entity
-        for entity in config_entry.data[CONF_ENTITIES]
-        if entity[CONF_PLATFORM] == "switch"
-    ]
-    if not switches_to_setup:
+    device, entities_to_setup = prepare_setup_entities(
+        config_entry, DOMAIN
+    )
+    if not entities_to_setup:
         return
 
     switches = []
-    pytuyadevice = pytuya.OutletDevice(
-        config_entry.data[CONF_DEVICE_ID],
-        config_entry.data[CONF_HOST],
-        config_entry.data[CONF_LOCAL_KEY],
-    )
-    pytuyadevice.set_version(float(config_entry.data[CONF_PROTOCOL_VERSION]))
-    pytuyadevice.set_dpsUsed({})
-
-    for device_config in switches_to_setup:
+    for device_config in entities_to_setup:
         switches.append(
-            TuyaDevice(
-                TuyaCache(pytuyadevice),
+            LocaltuyaSwitch(
+                TuyaCache(device, config_entry.data[CONF_FRIENDLY_NAME]),
                 device_config[CONF_FRIENDLY_NAME],
                 device_config[CONF_ID],
-                device_config[CONF_CURRENT],
-                device_config[CONF_CURRENT_CONSUMPTION],
-                device_config[CONF_VOLTAGE],
+                device_config.get(CONF_CURRENT),
+                device_config.get(CONF_CURRENT_CONSUMPTION),
+                device_config.get(CONF_VOLTAGE),
             )
         )
 
@@ -137,24 +115,18 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
     """Set up of the Tuya switch."""
-    config[CONF_PLATFORM] = "switch"
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": SOURCE_IMPORT}, data=config
-        )
-    )
-
-    return True
+    return import_from_yaml(hass, config, DOMAIN)
 
 
 class TuyaCache:
-    """Cache wrapper for pytuya.OutletDevice"""
+    """Cache wrapper for pytuya.TuyaDevice"""
 
-    def __init__(self, device):
+    def __init__(self, device, friendly_name):
         """Initialize the cache."""
         self._cached_status = ""
         self._cached_status_time = 0
         self._device = device
+        self._friendly_name = friendly_name
         self._lock = Lock()
 
     @property
@@ -181,13 +153,13 @@ class TuyaCache:
                     #                    return None
                     raise ConnectionError("Failed to update status .")
 
-    def set_status(self, state, switchid):
+    def set_dps(self, state, dps_index):
         """Change the Tuya switch status and clear the cache."""
         self._cached_status = ""
         self._cached_status_time = 0
         for i in range(5):
             try:
-                return self._device.set_status(state, switchid)
+                return self._device.set_dps(state, dps_index)
             except Exception:
                 print(
                     "Failed to set status of device [{}]".format(self._device.address)
@@ -214,7 +186,7 @@ class TuyaCache:
             self._lock.release()
 
 
-class TuyaDevice(SwitchEntity):
+class LocaltuyaSwitch(SwitchEntity):
     """Representation of a Tuya switch."""
 
     def __init__(
@@ -243,6 +215,19 @@ class TuyaDevice(SwitchEntity):
         )
 
     @property
+    def device_info(self):
+        return {
+            "identifiers": {
+                # Serial numbers are unique identifiers within a specific domain
+                ("LocalTuya", f"local_{self._device.unique_id}")
+            },
+            "name": self._device._friendly_name,
+            "manufacturer": "Tuya generic",
+            "model": "SmartSwitch",
+            "sw_version": "3.3",
+        }
+
+    @property
     def name(self):
         """Get name of Tuya switch."""
         return self._name
@@ -265,29 +250,23 @@ class TuyaDevice(SwitchEntity):
     @property
     def device_state_attributes(self):
         attrs = {}
-        try:
-            attrs[ATTR_CURRENT] = "{}".format(self._status["dps"][self._attr_current])
-            attrs[ATTR_CURRENT_CONSUMPTION] = "{}".format(
+        if self._attr_current:
+            attrs[ATTR_CURRENT] = self._status["dps"][self._attr_current]
+        if self._attr_consumption:
+            attrs[ATTR_CURRENT_CONSUMPTION] = (
                 self._status["dps"][self._attr_consumption] / 10
             )
-            attrs[ATTR_VOLTAGE] = "{}".format(
-                self._status["dps"][self._attr_voltage] / 10
-            )
-        #            print('attrs[ATTR_CURRENT]: [{}]'.format(attrs[ATTR_CURRENT]))
-        #            print('attrs[ATTR_CURRENT_CONSUMPTION]: [{}]'.format(attrs[ATTR_CURRENT_CONSUMPTION]))
-        #            print('attrs[ATTR_VOLTAGE]: [{}]'.format(attrs[ATTR_VOLTAGE]))
-
-        except KeyError:
-            pass
+        if self._attr_voltage:
+            attrs[ATTR_VOLTAGE] = self._status["dps"][self._attr_voltage] / 10
         return attrs
 
     def turn_on(self, **kwargs):
         """Turn Tuya switch on."""
-        self._device.set_status(True, self._switch_id)
+        self._device.set_dps(True, self._switch_id)
 
     def turn_off(self, **kwargs):
         """Turn Tuya switch off."""
-        self._device.set_status(False, self._switch_id)
+        self._device.set_dps(False, self._switch_id)
 
     def update(self):
         """Get state of Tuya switch."""

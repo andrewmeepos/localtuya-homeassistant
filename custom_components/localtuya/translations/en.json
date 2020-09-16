@@ -34,7 +34,7 @@
                 "description": "Please fill out the details for an entity with type `{platform}`.",
                 "data": {
                     "id": "ID",
-                    "friendly_name": "Friendly Name",
+                    "friendly_name": "Friendly name",
                     "current": "Current",
                     "current_consumption": "Current Consumption",
                     "voltage": "Voltage",
@@ -43,7 +43,8 @@
                     "stop_cmd": "Stop Command",
                     "get_position_key": "Get Position Key",
                     "set_position_key": "Set Position Key",
-                    "cover_command_key": "Open/Close/Stop Key"
+                    "cover_command_key": "Open/Close/Stop Key",
+                    "last_movement_key": "Last Movement Key"
                 }
             }
         }
