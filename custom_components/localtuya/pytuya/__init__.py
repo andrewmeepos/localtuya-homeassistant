@@ -1,16 +1,42 @@
-# Python module to interface with Shenzhen Xenon ESP8266MOD WiFi smart devices
-# E.g. https://wikidevi.com/wiki/Xenon_SM-PW701U
-#   SKYROKU SM-PW701U Wi-Fi Plug Smart Plug
-#   Wuudi SM-S0301-US - WIFI Smart Power Socket Multi Plug with 4 AC Outlets and 4 USB Charging Works with Alexa
-#
-# This would not exist without the protocol reverse engineering from
-# https://github.com/codetheweb/tuyapi by codetheweb and blackrozes
-#
-# Tested with Python 2.7 and Python 3.6.1 only
+# PyTuya Module
+# -*- coding: utf-8 -*-
+"""
+ Python module to interface with Tuya WiFi smart devices
+ Mostly derived from Shenzhen Xenon ESP8266MOD WiFi smart devices
+ E.g. https://wikidevi.com/wiki/Xenon_SM-PW701U
 
+ Author: clach04
+ Maintained by: rospogrigio
+
+ For more information see https://github.com/clach04/python-tuya
+
+ Classes
+    TuyaDevice(dev_id, address, local_key=None)
+        dev_id (str): Device ID e.g. 01234567891234567890
+        address (str): Device Network IP Address e.g. 10.0.1.99
+        local_key (str, optional): The encryption key. Defaults to None.
+
+ Functions 
+    json = status()          # returns json payload
+    set_version(version)     #  3.1 [default] or 3.3
+    detect_available_dps()   # returns a list of available dps provided by the device
+    add_dps_to_request(dps_index)  # adds dps_index to the list of dps used by the device (to be queried in the payload)
+    set_dps(on, dps_index)   # Set value of any dps index.
+    set_timer(num_secs):
+
+        
+ Credits
+  * TuyaAPI https://github.com/codetheweb/tuyapi by codetheweb and blackrozes
+    For protocol reverse engineering 
+  * PyTuya https://github.com/clach04/python-tuya by clach04
+    The origin of this python module (now abandoned)
+  * LocalTuya https://github.com/rospogrigio/localtuya-homeassistant by rospogrigio
+    Updated pytuya to support devices with Device IDs of 22 characters
+"""
 
 import base64
 from hashlib import md5
+from itertools import chain
 import json
 import logging
 import socket
@@ -28,13 +54,13 @@ except ImportError:
     import pyaes  # https://github.com/ricmoo/pyaes
 
 
-version_tuple = (7, 0, 9)
+version_tuple = (8, 1, 0)
 version = version_string = __version__ = '%d.%d.%d' % version_tuple
 __author__ = 'rospogrigio'
 
 log = logging.getLogger(__name__)
 logging.basicConfig()  # TODO include function name/line numbers in log
-#log.setLevel(level=logging.DEBUG)  # Debug hack!
+#log.setLevel(level=logging.DEBUG)  # Uncomment to Debug 
 
 log.debug('%s version %s', __name__, version)
 log.debug('Python %s on %s', sys.version, sys.platform)
@@ -55,7 +81,6 @@ IS_PY2 = sys.version_info[0] == 2
 
 class AESCipher(object):
     def __init__(self, key):
-        #self.bs = 32  # 32 work fines for ON, does not work for OFF. Padding different compared to js version https://github.com/codetheweb/tuyapi/
         self.bs = 16
         self.key = key
     def encrypt(self, raw, use_base64 = True):
@@ -68,7 +93,6 @@ class AESCipher(object):
             cipher = pyaes.blockfeeder.Encrypter(pyaes.AESModeOfOperationECB(self.key))  # no IV, auto pads to 16
             crypted_text = cipher.feed(raw)
             crypted_text += cipher.feed()  # flush final block
-        #print('crypted_text %r' % crypted_text)
         #print('crypted_text (%d) %r' % (len(crypted_text), crypted_text))
         if use_base64:
             return base64.b64encode(crypted_text)
@@ -119,10 +143,11 @@ def hex2bin(x):
     else:
         return bytes.fromhex(x)
 
-# This is intended to match requests.json payload at https://github.com/codetheweb/tuyapi
-# device20 or device22 are to be used depending on the length of dev_id (20 or 22 chars)
+# This is intended to match requests.json payload at https://github.com/codetheweb/tuyapi :
+# type_0a devices require the 0a command as the status request
+# type_0d devices require the 0d command as the status request, and the list of dps used set to null in the request payload (see generate_payload method)
 payload_dict = {
-  "device20": {
+  "type_0a": {
     "status": {
       "hexByte": "0a",
       "command": {"gwId": "", "devId": ""}
@@ -134,7 +159,7 @@ payload_dict = {
     "prefix": "000055aa00000000000000",    # Next byte is command byte ("hexByte") some zero padding, then length of remaining payload, i.e. command + suffix (unclear if multiple bytes used for length, zero padding implies could be more than one byte)
     "suffix": "000000000000aa55"
   },
-  "device22": {
+  "type_0d": {
     "status": {
       "hexByte": "0d",
       "command": {"devId": "", "uid": "", "t": ""}
@@ -148,8 +173,9 @@ payload_dict = {
   }
 }
 
-class XenonDevice(object):
-    def __init__(self, dev_id, address, local_key=None, connection_timeout=10):
+
+class TuyaDevice(object):
+    def __init__(self, dev_id, address, local_key, connection_timeout=10):
         """
         Represents a Tuya device.
         
@@ -164,17 +190,14 @@ class XenonDevice(object):
 
         self.id = dev_id
         self.address = address
-        self.local_key = local_key
         self.local_key = local_key.encode('latin1')
         self.connection_timeout = connection_timeout
         self.version = 3.1
-        if len(dev_id) == 22:
-            self.dev_type = 'device22'
-        else:
-            self.dev_type = 'device20'
+        self.dev_type = 'type_0a'
+        self.dps_to_request = {}
 
         self.port = 6668  # default - do not expect caller to pass in
-
+        
     def __repr__(self):
         return '%r' % ((self.id, self.address),)  # FIXME can do better than this
 
@@ -219,8 +242,60 @@ class XenonDevice(object):
     def set_version(self, version):
         self.version = version
 
-    def set_dpsUsed(self, dpsUsed):
-        self.dpsUsed = dpsUsed
+    def detect_available_dps(self):
+        # type_0d devices need a sort of bruteforce querying in order to detect the list of available dps 
+        # experience shows that the dps available are usually in the ranges [1-25] and [100-110]
+        # need to split the bruteforcing in different steps due to request payload limitation (max. length = 255)
+        detected_dps = {}
+
+        # dps 1 must always be sent, otherwise it might fail in case no dps is found in the requested range
+        self.dps_to_request = {"1": None}
+        self.add_dps_to_request(range(2, 11))
+        try:
+            data = self.status()
+        except Exception as e:
+            print("Failed to get status: [{}]".format(e))
+            raise CannotConnect
+        detected_dps.update( data["dps"] )
+
+        if self.dev_type == "type_0a":
+            return detected_dps
+
+        self.dps_to_request = {"1": None}
+        self.add_dps_to_request(range(11, 21))
+        try:
+            data = self.status()
+        except Exception as e:
+            print("Failed to get status: [{}]".format(e))
+            raise CannotConnect
+        detected_dps.update( data["dps"] )
+
+        self.dps_to_request = {"1": None}
+        self.add_dps_to_request(range(21, 31))
+        try:
+            data = self.status()
+        except Exception as e:
+            print("Failed to get status: [{}]".format(e))
+            raise CannotConnect
+        detected_dps.update( data["dps"] )
+
+        self.dps_to_request = {"1": None}
+        self.add_dps_to_request(range(100, 111))
+        try:
+            data = self.status()
+        except Exception as e:
+            print("Failed to get status: [{}]".format(e))
+            raise CannotConnect
+        detected_dps.update( data["dps"] )
+#        print("DATA IS [{}] detected_dps [{}]".format(data,detected_dps))
+
+        return detected_dps
+
+    def add_dps_to_request(self, dps_index):
+        if isinstance(dps_index, int):
+            self.dps_to_request[str(dps_index)] = None
+        else:
+            self.dps_to_request.update({str(index): None for index in dps_index})
 
     def generate_payload(self, command, data=None):
         """
@@ -247,8 +322,8 @@ class XenonDevice(object):
         if data is not None:
             json_data['dps'] = data
         if command_hb == '0d':
-            json_data['dps'] = self.dpsUsed
-#            log.info('******** COMMAND IS %r', self.dpsUsed)
+            json_data['dps'] = self.dps_to_request
+#            log.info('******** COMMAND IS %r', self.dps_to_request)
 
         # Create byte buffer from hex data
         json_payload = json.dumps(json_data)
@@ -267,33 +342,17 @@ class XenonDevice(object):
                 json_payload = PROTOCOL_VERSION_BYTES_33 + b"\0\0\0\0\0\0\0\0\0\0\0\0" + json_payload
         elif command == SET:
             # need to encrypt
-            #print('json_payload %r' % json_payload)
             self.cipher = AESCipher(self.local_key)  # expect to connect and then disconnect to set new
             json_payload = self.cipher.encrypt(json_payload)
-            #print('crypted json_payload %r' % json_payload)
             preMd5String = b'data=' + json_payload + b'||lpv=' + PROTOCOL_VERSION_BYTES_31 + b'||' + self.local_key
-            #print('preMd5String %r' % preMd5String)
             m = md5()
             m.update(preMd5String)
-            #print(repr(m.digest()))
             hexdigest = m.hexdigest()
-            #print(hexdigest)
-            #print(hexdigest[8:][:16])
             json_payload = PROTOCOL_VERSION_BYTES_31 + hexdigest[8:][:16].encode('latin1') + json_payload
-            #print('data_to_send')
-            #print(json_payload)
-            #print('crypted json_payload (%d) %r' % (len(json_payload), json_payload))
-            #print('json_payload  %r' % repr(json_payload))
-            #print('json_payload len %r' % len(json_payload))
-            #print(bin2hex(json_payload))
             self.cipher = None  # expect to connect and then disconnect to set new
 
 
         postfix_payload = hex2bin(bin2hex(json_payload) + payload_dict[self.dev_type]['suffix'])
-        #print('postfix_payload %r' % postfix_payload)
-        #print('postfix_payload %r' % len(postfix_payload))
-        #print('postfix_payload %x' % len(postfix_payload))
-        #print('postfix_payload %r' % hex(len(postfix_payload)))
         assert len(postfix_payload) <= 0xff
         postfix_payload_hex_len = '%x' % len(postfix_payload)  # TODO this assumes a single byte 0-255 (0x00-0xff)
         buffer = hex2bin( payload_dict[self.dev_type]['prefix'] + 
@@ -304,29 +363,20 @@ class XenonDevice(object):
         # calc the CRC of everything except where the CRC goes and the suffix
         hex_crc = format(binascii.crc32(buffer[:-8]) & 0xffffffff, '08X')
         buffer = buffer[:-8] + hex2bin(hex_crc) + buffer[-4:]
-        #print('command', command)
-        #print('prefix')
-        #print(payload_dict[self.dev_type][command]['prefix'])
-        #print(repr(buffer))
-        #print(bin2hex(buffer, pretty=False))
         #print('full buffer(%d) %r' % (len(buffer), bin2hex(buffer, pretty=True) ))
         #print('full buffer(%d) %r' % (len(buffer), " ".join("{:02x}".format(ord(c)) for c in buffer)))
         return buffer
-    
-class Device(XenonDevice):
-    def __init__(self, dev_id, address, local_key=None, dev_type=None):
-        super(Device, self).__init__(dev_id, address, local_key, dev_type)
-    
+        
     def status(self):
-        #log.debug('status() entry (dev_type is %s)', self.dev_type)
+        log.debug('status() entry (dev_type is %s)', self.dev_type)
         # open device, send request, then close connection
         payload = self.generate_payload('status')
 
         data = self._send_receive(payload)
-        #log.debug('status received data=%r', data)
+        log.debug('status received data=%r', data)
 
         result = data[20:-8]  # hard coded offsets
-        if self.dev_type != 'device20':
+        if self.dev_type != 'type_0a':
             result = result[15:]
 
         log.debug('result=%r', result)
@@ -353,62 +403,38 @@ class Device(XenonDevice):
             cipher = AESCipher(self.local_key)
             result = cipher.decrypt(result, False)
             log.debug('decrypted result=%r', result)
+            if "data unvalid" in result:
+                self.dev_type = 'type_0d'
+                log.debug("'data unvalid' error detected: switching to dev_type %r", self.dev_type)
+                return self.status()
             if not isinstance(result, str):
                 result = result.decode()
             result = json.loads(result)
         else:
             log.error('Unexpected status() payload=%r', result)
 
-#        if self.dev_type == 'cover':
-#        result = result.encode('utf-8')
-#        log.debug('encoded result=%r', result)
         return result
-
-    def set_status(self, on, switch=1):
-        """
-        Set status of the device to 'on' or 'off'.
-        
-        Args:
-            on(bool):  True for 'on', False for 'off'.
-            switch(int): The switch to set
-        """
-        # open device, send request, then close connection
-        if isinstance(switch, int):
-            switch = str(switch)  # index and payload is a string
-        payload = self.generate_payload(SET, {switch:on})
-        #print('payload %r' % payload)
-
-        data = self._send_receive(payload)
-        #log.debug('set_status received data=%r', data)
-
-        return data
     
-    def set_value(self, index, value):
+    def set_dps(self, value, dps_index):
         """
-        Set int value of any index.
+        Set value (may be any type: bool, int or string) of any dps index.
 
         Args:
-            index(int): index to set
-            value(int): new value for the index
+            dps_index(int):   dps index to set
+            value: new value for the dps index
         """
         # open device, send request, then close connection
-        if isinstance(index, int):
-            index = str(index)  # index and payload is a string
+        if isinstance(dps_index, int):
+            dps_index = str(dps_index)  # index and payload is a string
 
         payload = self.generate_payload(SET, {
-            index: value})
+            dps_index: value})
         
         data = self._send_receive(payload)
+        log.debug('set_dps received data=%r', data)
         
         return data
     
-    def turn_on(self, switch=1):
-        """Turn the device on"""
-        self.set_status(True, switch)
-
-    def turn_off(self, switch=1):
-        """Turn the device off"""
-        self.set_status(False, switch)
 
     def set_timer(self, num_secs):
         """
@@ -429,243 +455,5 @@ class Device(XenonDevice):
         payload = self.generate_payload(SET, {dps_id:num_secs})
 
         data = self._send_receive(payload)
-        #log.debug('set_timer received data=%r', data)
+        log.debug('set_timer received data=%r', data)
         return data
-
-class OutletDevice(Device):
-    def __init__(self, dev_id, address, local_key=None):
-        super(OutletDevice, self).__init__(dev_id, address, local_key)
-
-class FanDevice(Device):
-    DPS_INDEX_SPEED = '2'
-
-    def __init__(self, dev_id, address, local_key=None):
-        super(FanDevice, self).__init__(dev_id, address, local_key)
-
-class CoverDevice(Device):
-    DPS_INDEX_MOVE       = '1'
-    DPS_INDEX_BL         = '101'
-
-    DPS_2_STATE = {
-                '1':'movement',
-                '101':'backlight',
-                }
-
-    def __init__(self, dev_id, address, local_key=None):
-        print('%s version %s' % ( __name__, version))
-        print('Python %s on %s' % (sys.version, sys.platform))
-        if Crypto is None:
-            print('Using pyaes version ', pyaes.VERSION)
-            print('Using pyaes from ', pyaes.__file__)
-        else:
-            print('Using PyCrypto ', Crypto.version_info)
-            print('Using PyCrypto from ', Crypto.__file__)
-        super(CoverDevice, self).__init__(dev_id, address, local_key)
-    
-    def open_cover(self, switch=1):
-        """Turn the device on"""
-        self.set_status('on', switch)
-
-    def close_cover(self, switch=1):
-        """Turn the device off"""
-        self.set_status('off', switch)
-
-    def stop_cover(self, switch=1):
-        """Turn the device off"""
-        self.set_status('stop', switch)
-
-
-class BulbDevice(Device):
-    DPS_INDEX_ON         = '1'
-    DPS_INDEX_MODE       = '2'
-    DPS_INDEX_BRIGHTNESS = '3'
-    DPS_INDEX_COLOURTEMP = '4'
-    DPS_INDEX_COLOUR     = '5'
-
-    DPS             = 'dps'
-    DPS_MODE_COLOUR = 'colour'
-    DPS_MODE_WHITE  = 'white'
-    
-    DPS_2_STATE = {
-                '1':'is_on',
-                '2':'mode',
-                '3':'brightness',
-                '4':'colourtemp',
-                '5':'colour',
-                }
-
-    def __init__(self, dev_id, address, local_key=None):
-        super(BulbDevice, self).__init__(dev_id, address, local_key)
-
-    @staticmethod
-    def _rgb_to_hexvalue(r, g, b):
-        """
-        Convert an RGB value to the hex representation expected by tuya.
-        
-        Index '5' (DPS_INDEX_COLOUR) is assumed to be in the format:
-        rrggbb0hhhssvv
-        
-        While r, g and b are just hexadecimal values of the corresponding
-        Red, Green and Blue values, the h, s and v values (which are values
-        between 0 and 1) are scaled to 360 (h) and 255 (s and v) respectively.
-        
-        Args:
-            r(int): Value for the colour red as int from 0-255.
-            g(int): Value for the colour green as int from 0-255.
-            b(int): Value for the colour blue as int from 0-255.
-        """
-        rgb = [r,g,b]
-        hsv = colorsys.rgb_to_hsv(rgb[0]/255, rgb[1]/255, rgb[2]/255)
-
-        hexvalue = ""
-        for value in rgb:
-            temp = str(hex(int(value))).replace("0x","")
-            if len(temp) == 1:
-                temp = "0" + temp
-            hexvalue = hexvalue + temp
-
-        hsvarray = [int(hsv[0] * 360), int(hsv[1] * 255), int(hsv[2] * 255)]
-        hexvalue_hsv = ""
-        for value in hsvarray:
-            temp = str(hex(int(value))).replace("0x","")
-            if len(temp) == 1:
-                temp = "0" + temp
-            hexvalue_hsv = hexvalue_hsv + temp
-        if len(hexvalue_hsv) == 7:
-            hexvalue = hexvalue + "0" + hexvalue_hsv
-        else:
-            hexvalue = hexvalue + "00" + hexvalue_hsv
-
-        return hexvalue
-
-    @staticmethod
-    def _hexvalue_to_rgb(hexvalue):
-        """
-        Converts the hexvalue used by tuya for colour representation into
-        an RGB value.
-        
-        Args:
-            hexvalue(string): The hex representation generated by BulbDevice._rgb_to_hexvalue()
-        """
-        r = int(hexvalue[0:2], 16)
-        g = int(hexvalue[2:4], 16)
-        b = int(hexvalue[4:6], 16)
-
-        return (r, g, b)
-
-    @staticmethod
-    def _hexvalue_to_hsv(hexvalue):
-        """
-        Converts the hexvalue used by tuya for colour representation into
-        an HSV value.
-        
-        Args:
-            hexvalue(string): The hex representation generated by BulbDevice._rgb_to_hexvalue()
-        """
-        h = int(hexvalue[7:10], 16) / 360
-        s = int(hexvalue[10:12], 16) / 255
-        v = int(hexvalue[12:14], 16) / 255
-
-        return (h, s, v)
-
-    def set_colour(self, r, g, b):
-        """
-        Set colour of an rgb bulb.
-
-        Args:
-            r(int): Value for the colour red as int from 0-255.
-            g(int): Value for the colour green as int from 0-255.
-            b(int): Value for the colour blue as int from 0-255.
-        """
-        if not 0 <= r <= 255:
-            raise ValueError("The value for red needs to be between 0 and 255.")
-        if not 0 <= g <= 255:
-            raise ValueError("The value for green needs to be between 0 and 255.")
-        if not 0 <= b <= 255:
-            raise ValueError("The value for blue needs to be between 0 and 255.")
-
-        #print(BulbDevice)
-        hexvalue = BulbDevice._rgb_to_hexvalue(r, g, b)
-
-        payload = self.generate_payload(SET, {
-            self.DPS_INDEX_MODE: self.DPS_MODE_COLOUR,
-            self.DPS_INDEX_COLOUR: hexvalue})
-        data = self._send_receive(payload)
-        return data
-
-    def set_white(self, brightness, colourtemp):
-        """
-        Set white coloured theme of an rgb bulb.
-
-        Args:
-            brightness(int): Value for the brightness (25-255).
-            colourtemp(int): Value for the colour temperature (0-255).
-        """
-        if not 25 <= brightness <= 255:
-            raise ValueError("The brightness needs to be between 25 and 255.")
-        if not 0 <= colourtemp <= 255:
-            raise ValueError("The colour temperature needs to be between 0 and 255.")
-
-        payload = self.generate_payload(SET, {
-            self.DPS_INDEX_MODE: self.DPS_MODE_WHITE,
-            self.DPS_INDEX_BRIGHTNESS: brightness,
-            self.DPS_INDEX_COLOURTEMP: colourtemp})
-
-        data = self._send_receive(payload)
-        return data
-
-    def set_brightness(self, brightness):
-        """
-        Set the brightness value of an rgb bulb.
-
-        Args:
-            brightness(int): Value for the brightness (25-255).
-        """
-        if not 25 <= brightness <= 255:
-            raise ValueError("The brightness needs to be between 25 and 255.")
-
-        payload = self.generate_payload(SET, {self.DPS_INDEX_BRIGHTNESS: brightness})
-        data = self._send_receive(payload)
-        return data
-
-    def set_colourtemp(self, colourtemp):
-        """
-        Set the colour temperature of an rgb bulb.
-
-        Args:
-            colourtemp(int): Value for the colour temperature (0-255).
-        """
-        if not 0 <= colourtemp <= 255:
-            raise ValueError("The colour temperature needs to be between 0 and 255.")
-
-        payload = self.generate_payload(SET, {self.DPS_INDEX_COLOURTEMP: colourtemp})
-        data = self._send_receive(payload)
-        return data
-
-    def brightness(self):
-        """Return brightness value"""
-        return self.status()[self.DPS][self.DPS_INDEX_BRIGHTNESS]
-
-    def colourtemp(self):
-        """Return colour temperature"""
-        return self.status()[self.DPS][self.DPS_INDEX_COLOURTEMP]
-
-    def colour_rgb(self):
-        """Return colour as RGB value"""
-        hexvalue = self.status()[self.DPS][self.DPS_INDEX_COLOUR]
-        return BulbDevice._hexvalue_to_rgb(hexvalue)
-
-    def colour_hsv(self):
-        """Return colour as HSV value"""
-        hexvalue = self.status()[self.DPS][self.DPS_INDEX_COLOUR]
-        return BulbDevice._hexvalue_to_hsv(hexvalue)
-
-    def state(self):
-        status = self.status()
-        state = {}
-
-        for key in status[self.DPS].keys():
-            if(int(key)<=5):
-                state[self.DPS_2_STATE[key]]=status[self.DPS][key]
-
-        return state
